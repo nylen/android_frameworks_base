@@ -27,6 +27,7 @@ import org.xmlpull.v1.XmlSerializer;
 import android.app.ActivityManagerNative;
 import android.app.IActivityManager;
 import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -57,6 +58,7 @@ import android.content.pm.ProviderInfo;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.pm.Signature;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
@@ -73,6 +75,7 @@ import android.os.Process;
 import android.os.ServiceManager;
 import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.provider.Settings;
 import android.util.*;
 import android.view.Display;
 import android.view.WindowManager;
@@ -165,9 +168,15 @@ class PackageManagerService extends IPackageManager.Stub {
     // This is the object monitoring mAppInstallDir.
     final FileObserver mAppInstallObserver;
 
+    // This is the object monitoring mSdExtInstallDir.
+    final FileObserver mSdExtInstallObserver;
+
     // This is the object monitoring mDrmAppPrivateInstallDir.
     final FileObserver mDrmAppInstallObserver;
 
+    // This is the object monitoring mDrmSdExtPrivateInstallDir.
+    final FileObserver mDrmSdExtInstallObserver;
+    
     // Used for priviledge escalation.  MUST NOT BE CALLED WITH mPackages
     // LOCK HELD.  Can be called with mInstallLock held.
     final Installer mInstaller;
@@ -175,10 +184,17 @@ class PackageManagerService extends IPackageManager.Stub {
     final File mFrameworkDir;
     final File mSystemAppDir;
     final File mAppInstallDir;
+    final File mSdExtInstallDir;
+    final File mDalvikCacheDir;
+    final File mSdExtDalvikCacheDir;
+    
+    // Whether or not we are installing on the EXT partition.
+    boolean mExtInstall;
 
     // Directory containing the private parts (e.g. code and non-resource assets) of forward-locked
     // apps.
     final File mDrmAppPrivateInstallDir;
+    final File mDrmSdExtPrivateInstallDir;
     
     // ----------------------------------------------------------------
     
@@ -207,7 +223,7 @@ class PackageManagerService extends IPackageManager.Stub {
     final HashMap<String, PackageParser.Package> mPackages =
             new HashMap<String, PackageParser.Package>();
 
-    final Settings mSettings;
+    final DynamicSettings mSettings;
     boolean mRestoredSettings;
     boolean mReportedUidError;
 
@@ -312,7 +328,7 @@ class PackageManagerService extends IPackageManager.Stub {
         mFactoryTest = factoryTest;
         mNoDexOpt = "eng".equals(SystemProperties.get("ro.build.type"));
         mMetrics = new DisplayMetrics();
-        mSettings = new Settings();
+        mSettings = new DynamicSettings();
         mSettings.addSharedUserLP("android.uid.system",
                 Process.SYSTEM_UID, ApplicationInfo.FLAG_SYSTEM);
         mSettings.addSharedUserLP("android.uid.phone",
@@ -358,9 +374,12 @@ class PackageManagerService extends IPackageManager.Stub {
             mHandler = new Handler(mHandlerThread.getLooper());
             
             File dataDir = Environment.getDataDirectory();
+            File sdExtDir = Environment.getSdExtDirectory();
             mAppDataDir = new File(dataDir, "data");
+            mSdExtInstallDir = new File(sdExtDir, "app");
             mDrmAppPrivateInstallDir = new File(dataDir, "app-private");
-
+            mDrmSdExtPrivateInstallDir = new File(sdExtDir, "app-private");
+            
             if (mInstaller == null) {
                 // Make sure these dirs exist, when we are running in
                 // the simulator.
@@ -369,6 +388,8 @@ class PackageManagerService extends IPackageManager.Stub {
                 miscDir.mkdirs();
                 mAppDataDir.mkdirs();
                 mDrmAppPrivateInstallDir.mkdirs();
+                mSdExtInstallDir.mkdirs();
+                mDrmSdExtPrivateInstallDir.mkdirs();
             }
 
             readPermissions();
@@ -388,8 +409,11 @@ class PackageManagerService extends IPackageManager.Stub {
             final HashSet<String> libFiles = new HashSet<String>();
             
             mFrameworkDir = new File(Environment.getRootDirectory(), "framework");
+            mDalvikCacheDir = new File(dataDir, "dalvik-cache");
+            mSdExtDalvikCacheDir = new File(sdExtDir, "dalvik-cache");
             
             if (mInstaller != null) {
+                boolean didDexOpt = false;
                 /**
                  * Out of paranoia, ensure that everything in the boot class
                  * path has been dexed.
@@ -402,6 +426,7 @@ class PackageManagerService extends IPackageManager.Stub {
                             if (dalvik.system.DexFile.isDexOptNeeded(paths[i])) {
                                 libFiles.add(paths[i]);
                                 mInstaller.dexopt(paths[i], Process.SYSTEM_UID, true);
+                                didDexOpt = true;
                             }
                         } catch (FileNotFoundException e) {
                             Log.w(TAG, "Boot class path not found: " + paths[i]);
@@ -424,6 +449,7 @@ class PackageManagerService extends IPackageManager.Stub {
                             if (dalvik.system.DexFile.isDexOptNeeded(lib)) {
                                 libFiles.add(lib);
                                 mInstaller.dexopt(lib, Process.SYSTEM_UID, true);
+                                didDexOpt = true;
                             }
                         } catch (FileNotFoundException e) {
                             Log.w(TAG, "Library not found: " + lib);
@@ -458,11 +484,44 @@ class PackageManagerService extends IPackageManager.Stub {
                         try {
                             if (dalvik.system.DexFile.isDexOptNeeded(path)) {
                                 mInstaller.dexopt(path, Process.SYSTEM_UID, true);
+                                didDexOpt = true;
                             }
                         } catch (FileNotFoundException e) {
                             Log.w(TAG, "Jar not found: " + path);
                         } catch (IOException e) {
                             Log.w(TAG, "Exception reading jar: " + path, e);
+                        }
+                    }
+                }
+                
+                if (didDexOpt) {
+                    // If we had to do a dexopt of one of the previous
+                    // things, then something on the system has changed.
+                    // Consider this significant, and wipe away all other
+                    // existing dexopt files to ensure we don't leave any
+                    // dangling around.
+                    String[] files = mDalvikCacheDir.list();
+                    if (files != null) {
+                        for (int i=0; i<files.length; i++) {
+                            String fn = files[i];
+                            if (fn.startsWith("data@app@")
+                                    || fn.startsWith("data@app-private@")) {
+                                Log.i(TAG, "Pruning dalvik file: " + fn);
+                                (new File(mDalvikCacheDir, fn)).delete();
+                            }
+                        }
+                    }
+                    if (isA2SDActive()) {
+                        files = mSdExtDalvikCacheDir.list();
+                        if (files != null) {
+                            for (int i=0; i<files.length; i++) {
+                                String fn = files[i];
+                                if (fn.startsWith("sd-ext@app@")
+                                        || fn.startsWith("sd-ext@app-private@")) {
+                                    Log.i(TAG, "Pruning dalvik file: " + fn);
+                                    (new File(mSdExtDalvikCacheDir, fn)).delete();
+                                }
+                            }
                         }
                     }
                 }
@@ -501,11 +560,21 @@ class PackageManagerService extends IPackageManager.Stub {
             scanDirLI(mAppInstallDir, 0, scanMode);
             mAppInstallObserver.startWatching();
 
+            mSdExtInstallObserver = new AppDirObserver(
+                mSdExtInstallDir.getPath(), OBSERVER_EVENTS, false);
+            mSdExtInstallObserver.startWatching();
+            scanDirLI(mSdExtInstallDir, 0, scanMode);
+            
             mDrmAppInstallObserver = new AppDirObserver(
                 mDrmAppPrivateInstallDir.getPath(), OBSERVER_EVENTS, false);
             scanDirLI(mDrmAppPrivateInstallDir, 0, scanMode | SCAN_FORWARD_LOCKED);
             mDrmAppInstallObserver.startWatching();
 
+            mDrmSdExtInstallObserver = new AppDirObserver(
+                mDrmSdExtPrivateInstallDir.getPath(), OBSERVER_EVENTS, false);
+            mDrmSdExtInstallObserver.startWatching();
+            scanDirLI(mDrmSdExtPrivateInstallDir, 0, scanMode | SCAN_FORWARD_LOCKED);
+                
             EventLog.writeEvent(LOG_BOOT_PROGRESS_PMS_SCAN_END,
                     SystemClock.uptimeMillis());
             Log.i(TAG, "Time to scan packages: "
@@ -1808,16 +1877,17 @@ class PackageManagerService extends IPackageManager.Stub {
 
         String[] files = dir.list();
 
-        int i;
-        for (i=0; i<files.length; i++) {
-            File file = new File(dir, files[i]);
-            File resFile = file;
-            // Pick up the resource path from settings for fwd locked apps
-            if ((scanMode & SCAN_FORWARD_LOCKED) != 0) {
-                resFile = null;
+        if (files != null) {
+            for (int i=0; i<files.length; i++) {
+                File file = new File(dir, files[i]);
+                File resFile = file;
+                // Pick up the resource path from settings for fwd locked apps
+                if ((scanMode & SCAN_FORWARD_LOCKED) != 0) {
+                    resFile = null;
+                }
+                PackageParser.Package pkg = scanPackageLI(file, file, resFile,
+                        flags|PackageParser.PARSE_MUST_BE_APK, scanMode);
             }
-            PackageParser.Package pkg = scanPackageLI(file, file, resFile,
-                    flags|PackageParser.PARSE_MUST_BE_APK, scanMode);
         }
     }
 
@@ -1919,8 +1989,8 @@ class PackageManagerService extends IPackageManager.Stub {
             scanMode |= SCAN_FORWARD_LOCKED;
         }
         File resFile = destResourceFile;
-        if (ps != null && (scanMode & SCAN_FORWARD_LOCKED) != 0) {
-            resFile = getFwdLockedResource(ps.name);
+        if (ps != null && ((scanMode & SCAN_FORWARD_LOCKED) != 0)) {
+            resFile = getFwdLockedResource(ps.name, ps.codePath.getAbsolutePath());
         }
         // Note that we invoke the following method only if we are about to unpack an application
         return scanPackageLI(scanFile, destCodeFile, resFile,
@@ -2159,6 +2229,11 @@ class PackageManagerService extends IPackageManager.Stub {
 
             // Just create the setting, don't add it yet. For already existing packages
             // the PkgSetting exists already and doesn't have to be created.
+            if (destResourceFile == null && ((scanMode&SCAN_FORWARD_LOCKED) != 0)) {
+                // Resource file was null, but we are in forward locked mode.. fix that.
+                destResourceFile = this.getFwdLockedResource(pkgName, destCodeFile.getAbsolutePath());
+                pkg.mForwardLocked = true;
+            }
             pkgSetting = mSettings.getPackageLP(pkg, suid, destCodeFile,
                             destResourceFile, pkg.applicationInfo.flags, true, false);
             if (pkgSetting == null) {
@@ -2325,6 +2400,19 @@ class PackageManagerService extends IPackageManager.Stub {
                         // Error from installer
                         mLastScanError = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
                         return null;
+                    }
+                    if (pkg.mForwardLocked) {
+                        // We found a package that should be forward locked, but no
+                        // data dir. This happens after a data wipe when apps are on
+                        // external storage.  Fix it.
+                        Log.i(TAG, "Fixing forward-locked package permissions: " + pkgName 
+                                + " uid: " + pkg.applicationInfo.uid);
+                        ret = mInstaller.setForwardLockPerm(pkgName, pkg.applicationInfo.uid,
+                                scanFile.getAbsolutePath().startsWith(Environment.getSdExtDirectory().getAbsolutePath()));
+                        if (ret < 0) {
+                            mLastScanError = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
+                            return null;
+                        }
                     }
                 } else {
                     dataPath.mkdirs();
@@ -3520,26 +3608,54 @@ class PackageManagerService extends IPackageManager.Stub {
         private final boolean mIsRom;
     }
 
+    private boolean isA2SDActive() {
+        return SystemProperties.getBoolean("cm.a2sd.active", false) ||
+               SystemProperties.getBoolean("cm.a2sd.force", false)  ;        
+    }
+    
     /* Called when a downloaded package installation has been confirmed by the user */
     public void installPackage(
             final Uri packageURI, final IPackageInstallObserver observer, final int flags) {
         installPackage(packageURI, observer, flags, null);
     }
     
+    /* Called when a downloaded package installation is completed (usually by the Market) */
+    public void installPackage(final Uri packageURI, final IPackageInstallObserver observer, final int flags, final String installerPackageName) {
+    	boolean a2sd = Settings.Secure.getInt(
+            mContext.getContentResolver(),Settings.Secure.APPS2SD, 0) > 0 && isA2SDActive();
+    	
+    	installPackageExt(packageURI, observer, flags, installerPackageName, a2sd);
+    }
+
+    public void installPackageExt(final Uri packageURI, final IPackageInstallObserver observer, final int flags, final String installerPackageName, boolean extInstall) {
+       installPackageFinal(packageURI, observer, flags, installerPackageName, extInstall);
+    }
+
     /* Called when a downloaded package installation has been confirmed by the user */
-    public void installPackage(
+    public void installPackageFinal(
             final Uri packageURI, final IPackageInstallObserver observer, final int flags,
-            final String installerPackageName) {
+            final String installerPackageName, boolean extInstall) {
         mContext.enforceCallingOrSelfPermission(
                 android.Manifest.permission.INSTALL_PACKAGES, null);
+
+        mExtInstall = extInstall;
         
         // Queue up an async operation since the package installation may take a little while.
         mHandler.post(new Runnable() {
             public void run() {
                 mHandler.removeCallbacks(this);
-                PackageInstalledInfo res;
-                synchronized (mInstallLock) {
-                    res = installPackageLI(packageURI, flags, true, installerPackageName);
+                 // Result object to be returned
+                PackageInstalledInfo res = new PackageInstalledInfo();
+                res.returnCode = PackageManager.INSTALL_SUCCEEDED;
+                res.uid = -1;
+                res.pkg = null;
+                res.removedInfo = new PackageRemovedInfo();
+                // Make a temporary copy of file from given packageURI
+                File tmpPackageFile = copyTempInstallFile(packageURI, res);
+                if (tmpPackageFile != null) {
+                    synchronized (mInstallLock) {
+                        installPackageLI(packageURI, flags, true, installerPackageName, tmpPackageFile, res);
+                    }
                 }
                 if (observer != null) {
                     try {
@@ -3753,11 +3869,30 @@ class PackageManagerService extends IPackageManager.Stub {
             // Since we failed to install the new package we need to restore the old
             // package that we deleted.
             if(deletedPkg) {
+                File restoreFile = new File(deletedPackage.mPath);
+                if (restoreFile == null) {
+                    Log.e(TAG, "Failed allocating storage when restoring pkg : " + pkgName);
+                    return;
+                }
+                File restoreTmpFile = createTempPackageFile();
+                if (restoreTmpFile == null) {
+                    Log.e(TAG, "Failed creating temp file when restoring pkg :  " + pkgName);
+                    return;
+                }
+                if (!FileUtils.copyFile(restoreFile, restoreTmpFile)) {
+                    Log.e(TAG, "Failed copying temp file when restoring pkg : " + pkgName);
+                    return;
+                }
+                PackageInstalledInfo restoreRes = new PackageInstalledInfo();
+                restoreRes.removedInfo = new PackageRemovedInfo();
                 installPackageLI(
-                        Uri.fromFile(new File(deletedPackage.mPath)),
+                        Uri.fromFile(restoreFile),
                         isForwardLocked(deletedPackage)
                         ? PackageManager.INSTALL_FORWARD_LOCK
-                                : 0, false, oldInstallerPackageName);
+                                : 0, false, oldInstallerPackageName, restoreTmpFile, restoreRes);
+                if (restoreRes.returnCode != PackageManager.INSTALL_SUCCEEDED) {
+                    Log.e(TAG, "Failed restoring pkg : " + pkgName + " after failed upgrade");
+                }
             }
         }
     }
@@ -3915,55 +4050,41 @@ class PackageManagerService extends IPackageManager.Stub {
         }
     }
     
-    private File getFwdLockedResource(String pkgName) {
+    private File getFwdLockedResource(String pkgName, String codePath) {
         final String publicZipFileName = pkgName + ".zip";
-        return new File(mAppInstallDir, publicZipFileName);
+        return new File(codePath.startsWith(Environment.getSdExtDirectory().getAbsolutePath()) ? mSdExtInstallDir : mAppInstallDir, publicZipFileName);
     }
 
-    private PackageInstalledInfo installPackageLI(Uri pPackageURI,
-            int pFlags, boolean newInstall, String installerPackageName) {
-        File tmpPackageFile = null;
-        String pkgName = null;
-        boolean forwardLocked = false;
-        boolean replacingExistingPackage = false;
-        // Result object to be returned
-        PackageInstalledInfo res = new PackageInstalledInfo();
-        res.returnCode = PackageManager.INSTALL_SUCCEEDED;
-        res.uid = -1;
-        res.pkg = null;
-        res.removedInfo = new PackageRemovedInfo();
+    private File copyTempInstallFile(Uri pPackageURI,
+            PackageInstalledInfo res) {
+        File tmpPackageFile = createTempPackageFile();
+        int retCode = PackageManager.INSTALL_SUCCEEDED;
+        if (tmpPackageFile == null) {
+            res.returnCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
+            return null;
+        }
 
-        main_flow: try {
-            tmpPackageFile = createTempPackageFile();
-            if (tmpPackageFile == null) {
-                res.returnCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
-                break main_flow;
+        if (pPackageURI.getScheme().equals("file")) {
+            final File srcPackageFile = new File(pPackageURI.getPath());
+            // We copy the source package file to a temp file and then rename it to the
+            // destination file in order to eliminate a window where the package directory
+            // scanner notices the new package file but it's not completely copied yet.
+            if (!FileUtils.copyFile(srcPackageFile, tmpPackageFile)) {
+                Log.e(TAG, "Couldn't copy package file to temp file.");
+                retCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
             }
-            tmpPackageFile.deleteOnExit();  // paranoia
-            if (pPackageURI.getScheme().equals("file")) {
-                final File srcPackageFile = new File(pPackageURI.getPath());
-                // We copy the source package file to a temp file and then rename it to the
-                // destination file in order to eliminate a window where the package directory
-                // scanner notices the new package file but it's not completely copied yet.
-                if (!FileUtils.copyFile(srcPackageFile, tmpPackageFile)) {
-                    Log.e(TAG, "Couldn't copy package file to temp file.");
-                    res.returnCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
-                    break main_flow;
-                }
-            } else if (pPackageURI.getScheme().equals("content")) {
-                ParcelFileDescriptor fd;
-                try {
-                    fd = mContext.getContentResolver().openFileDescriptor(pPackageURI, "r");
-                } catch (FileNotFoundException e) {
-                    Log.e(TAG, "Couldn't open file descriptor from download service.");
-                    res.returnCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
-                    break main_flow;
-                }
-                if (fd == null) {
-                    Log.e(TAG, "Couldn't open file descriptor from download service (null).");
-                    res.returnCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
-                    break main_flow;
-                }
+        } else if (pPackageURI.getScheme().equals("content")) {
+            ParcelFileDescriptor fd = null;
+            try {
+                fd = mContext.getContentResolver().openFileDescriptor(pPackageURI, "r");
+            } catch (FileNotFoundException e) {
+                Log.e(TAG, "Couldn't open file descriptor from download service. Failed with exception " + e);
+                retCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
+            }
+            if (fd == null) {
+                Log.e(TAG, "Couldn't open file descriptor from download service (null).");
+                retCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
+            } else {
                 if (Config.LOGV) {
                     Log.v(TAG, "Opened file descriptor from download service.");
                 }
@@ -3974,14 +4095,34 @@ class PackageManagerService extends IPackageManager.Stub {
                 // scanner notices the new package file but it's not completely copied yet.
                 if (!FileUtils.copyToFile(dlStream, tmpPackageFile)) {
                     Log.e(TAG, "Couldn't copy package stream to temp file.");
-                    res.returnCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
-                    break main_flow;
+                    retCode = PackageManager.INSTALL_FAILED_INSUFFICIENT_STORAGE;
                 }
-            } else {
-                Log.e(TAG, "Package URI is not 'file:' or 'content:' - " + pPackageURI);
-                res.returnCode = PackageManager.INSTALL_FAILED_INVALID_URI;
-                break main_flow;
             }
+        } else {
+            Log.e(TAG, "Package URI is not 'file:' or 'content:' - " + pPackageURI);
+            retCode = PackageManager.INSTALL_FAILED_INVALID_URI;
+        }
+
+        res.returnCode = retCode;
+        if (retCode != PackageManager.INSTALL_SUCCEEDED) {
+            if (tmpPackageFile != null && tmpPackageFile.exists()) {
+                tmpPackageFile.delete();
+            }
+            return null;
+        }
+        return tmpPackageFile;
+    }
+
+    private void installPackageLI(Uri pPackageURI,
+            int pFlags, boolean newInstall, String installerPackageName,
+            File tmpPackageFile, PackageInstalledInfo res) {
+        String pkgName = null;
+        boolean forwardLocked = false;
+        boolean replacingExistingPackage = false;
+        // Result object to be returned
+        res.returnCode = PackageManager.INSTALL_SUCCEEDED;
+
+        main_flow: try {
             pkgName = PackageParser.parsePackageName(
                     tmpPackageFile.getAbsolutePath(), 0);
             if (pkgName == null) {
@@ -3992,14 +4133,20 @@ class PackageManagerService extends IPackageManager.Stub {
             res.name = pkgName;
             //initialize some variables before installing pkg
             final String pkgFileName = pkgName + ".apk";
-            final File destDir = ((pFlags&PackageManager.INSTALL_FORWARD_LOCK) != 0)
-                                 ?  mDrmAppPrivateInstallDir
-                                 : mAppInstallDir;
+
+            // determine the destination directory.
+            File destDir = null;
+            if ((pFlags&PackageManager.INSTALL_FORWARD_LOCK) != 0) {
+                destDir = mExtInstall ? mDrmSdExtPrivateInstallDir : mDrmAppPrivateInstallDir;
+            } else {
+                destDir = mExtInstall ? mSdExtInstallDir : mAppInstallDir;
+            }
+
             final File destPackageFile = new File(destDir, pkgFileName);
             final String destFilePath = destPackageFile.getAbsolutePath();
             File destResourceFile;
             if ((pFlags&PackageManager.INSTALL_FORWARD_LOCK) != 0) {
-                destResourceFile = getFwdLockedResource(pkgName);
+                destResourceFile = getFwdLockedResource(pkgName, destFilePath);
                 forwardLocked = true;
             } else {
                 destResourceFile = destPackageFile;
@@ -4053,7 +4200,6 @@ class PackageManagerService extends IPackageManager.Stub {
                 tmpPackageFile.delete();
             }
         }
-        return res;
     }
     
     private int setPermissionsLI(String pkgName,
@@ -4074,7 +4220,8 @@ class PackageManagerService extends IPackageManager.Stub {
             }
             if (mInstaller != null) {
                 retCode = mInstaller.setForwardLockPerm(pkgName,
-                        newPackage.applicationInfo.uid);
+                        newPackage.applicationInfo.uid, 
+                        destFilePath.startsWith(Environment.getSdExtDirectory().getAbsolutePath()));
             } else {
                 final int filePermissions =
                         FileUtils.S_IRUSR|FileUtils.S_IWUSR|FileUtils.S_IRGRP;
@@ -4096,7 +4243,8 @@ class PackageManagerService extends IPackageManager.Stub {
 
     private boolean isForwardLocked(PackageParser.Package deletedPackage) {
         final ApplicationInfo applicationInfo = deletedPackage.applicationInfo;
-        return applicationInfo.sourceDir.startsWith(mDrmAppPrivateInstallDir.getAbsolutePath());
+        return applicationInfo.sourceDir.startsWith(mDrmAppPrivateInstallDir.getAbsolutePath())
+            || applicationInfo.sourceDir.startsWith(mDrmSdExtPrivateInstallDir.getAbsolutePath());
     }
 
     private void extractPublicFiles(PackageParser.Package newPackage,
@@ -4175,8 +4323,10 @@ class PackageManagerService extends IPackageManager.Stub {
 
     private File createTempPackageFile() {
         File tmpPackageFile;
+        File dir = mAppInstallDir;
+        if (mExtInstall) dir = mSdExtInstallDir;
         try {
-            tmpPackageFile = File.createTempFile("vmdl", ".tmp", mAppInstallDir);
+            tmpPackageFile = File.createTempFile("vmdl", ".tmp", dir);
         } catch (IOException e) {
             Log.e(TAG, "Couldn't create temp file for downloaded package file.");
             return null;
@@ -5746,7 +5896,7 @@ class PackageManagerService extends IPackageManager.Stub {
     /**
      * Holds information about dynamic settings.
      */
-    private static final class Settings {
+    private static final class DynamicSettings {
         private final File mSettingsFilename;
         private final File mBackupSettingsFilename;
         private final HashMap<String, PackageSetting> mPackages =
@@ -5816,7 +5966,7 @@ class PackageManagerService extends IPackageManager.Stub {
         private final ArrayList<PendingPackage> mPendingPackages
                 = new ArrayList<PendingPackage>();
 
-        Settings() {
+        DynamicSettings() {
             File dataDir = Environment.getDataDirectory();
             File systemDir = new File(dataDir, "system");
             systemDir.mkdirs();

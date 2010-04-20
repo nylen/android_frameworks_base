@@ -401,8 +401,8 @@ public class WindowManagerService extends IWindowManager.Stub
 
     PowerManagerService mPowerManager;
 
-    float mWindowAnimationScale = 1.0f;
-    float mTransitionAnimationScale = 1.0f;
+    float mWindowAnimationScale = 0.5f;
+    float mTransitionAnimationScale = 0.5f;
 
     final KeyWaiter mKeyWaiter = new KeyWaiter();
     final KeyQ mQueue;
@@ -4598,6 +4598,10 @@ public class WindowManagerService extends IWindowManager.Stub
                         //dump();
                         if (targetWin != null) {
                             at = targetWin.getAppToken();
+                            if (at == null) {
+                               removeWindowInnerLocked(targetWin.mSession, targetWin);
+                               return null;
+                            }
                         } else if (targetApp != null) {
                             at = targetApp.appToken;
                         }
